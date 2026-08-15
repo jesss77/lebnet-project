@@ -1,3 +1,7 @@
+import random
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import SGD
@@ -7,13 +11,39 @@ from src.models.resnet import get_resnet18
 from src.training.trainer import train_one_epoch, evaluate
 
 
+SEED = 42
+
+
+def set_seed(seed: int) -> None:
+    """Set random seeds for reproducible training."""
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    # Make CUDA operations as deterministic as possible.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    set_seed(SEED)
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
 
     print(f"Using device: {device}")
+    print(f"Random seed: {SEED}")
 
     train_loader, calibration_loader, test_loader = get_cifar10(
-        batch_size=128
+        batch_size=128,
+        seed=SEED,
     )
 
     model = get_resnet18().to(device)
@@ -53,12 +83,17 @@ def main():
             f"Test Acc: {test_accuracy:.4f}"
         )
 
+    results_dir = Path("results")
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_path = results_dir / "baseline_resnet18.pt"
+
     torch.save(
         model.state_dict(),
-        "results/baseline_resnet18.pt",
+        checkpoint_path,
     )
 
-    print("Model saved to results/baseline_resnet18.pt")
+    print(f"Model saved to {checkpoint_path}")
 
 
 if __name__ == "__main__":

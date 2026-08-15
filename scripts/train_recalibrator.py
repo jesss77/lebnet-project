@@ -7,17 +7,18 @@ from src.data.dataset import get_cifar10
 from src.models.resnet import get_resnet18
 from src.calibration.temperature import TemperatureScaler
 from src.calibration.metrics import (
+    accuracy,
+    brier_score,
+    calibration_bins,
     expected_calibration_error,
     negative_log_likelihood,
-    brier_score,
-    accuracy,
 )
 
 
-RESULTS_DIR = Path("results")
-
-
 def collect_predictions(model, loader, device):
+    """
+    Collect model logits and labels for an entire dataset split.
+    """
     model.eval()
 
     all_logits = []
@@ -40,15 +41,21 @@ def collect_predictions(model, loader, device):
 
 
 def calculate_metrics(logits, labels):
+    """
+    Calculate all calibration metrics for a set of logits.
+    """
     return {
-        "accuracy": float(accuracy(logits, labels)),
-        "ece": float(expected_calibration_error(logits, labels)),
-        "nll": float(negative_log_likelihood(logits, labels)),
-        "brier": float(brier_score(logits, labels)),
+        "accuracy": accuracy(logits, labels),
+        "ece": expected_calibration_error(logits, labels),
+        "nll": negative_log_likelihood(logits, labels),
+        "brier": brier_score(logits, labels),
     }
 
 
 def print_metrics(name, metrics):
+    """
+    Print a consistent metrics block.
+    """
     print(f"\n{name}:")
     print(f"  Accuracy: {metrics['accuracy']:.4f}")
     print(f"  ECE:      {metrics['ece']:.4f}")
@@ -63,34 +70,56 @@ def main():
 
     print(f"Using device: {device}")
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    # ---------------------------------------------------------
+    # Dataset
+    # ---------------------------------------------------------
 
     _, calibration_loader, test_loader = get_cifar10(
-        batch_size=128
+        batch_size=128,
     )
+
+    # ---------------------------------------------------------
+    # Load baseline model
+    # ---------------------------------------------------------
+
+    checkpoint_path = Path(
+        "results/baseline_resnet18.pt"
+    )
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Baseline checkpoint not found: {checkpoint_path}\n"
+            "Run `python -m scripts.train_baseline` first."
+        )
 
     model = get_resnet18().to(device)
 
-    checkpoint_path = RESULTS_DIR / "baseline_resnet18.pt"
-
-    model.load_state_dict(
-        torch.load(
-            checkpoint_path,
-            map_location=device,
-            weights_only=True,
-        )
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=True,
     )
+
+    model.load_state_dict(checkpoint)
 
     print("Baseline model loaded.")
 
+    # ---------------------------------------------------------
+    # Collect predictions
+    # ---------------------------------------------------------
+
     print("Collecting calibration predictions...")
-    calibration_logits, calibration_labels = collect_predictions(
-        model,
-        calibration_loader,
-        device,
+
+    calibration_logits, calibration_labels = (
+        collect_predictions(
+            model,
+            calibration_loader,
+            device,
+        )
     )
 
     print("Collecting test predictions...")
+
     test_logits, test_labels = collect_predictions(
         model,
         test_loader,
@@ -98,7 +127,7 @@ def main():
     )
 
     # ---------------------------------------------------------
-    # Baseline
+    # Baseline evaluation
     # ---------------------------------------------------------
 
     baseline_metrics = calculate_metrics(
@@ -110,9 +139,22 @@ def main():
     print("BASELINE")
     print("=" * 60)
 
-    print_metrics(
-        "Test Set",
-        baseline_metrics,
+    print("\nTest Set:")
+
+    print(
+        f"  Accuracy: {baseline_metrics['accuracy']:.4f}"
+    )
+
+    print(
+        f"  ECE:      {baseline_metrics['ece']:.4f}"
+    )
+
+    print(
+        f"  NLL:      {baseline_metrics['nll']:.4f}"
+    )
+
+    print(
+        f"  Brier:    {baseline_metrics['brier']:.4f}"
     )
 
     # ---------------------------------------------------------
@@ -123,9 +165,14 @@ def main():
     print("TEMPERATURE SCALING")
     print("=" * 60)
 
-    scaler = TemperatureScaler()
+    scaler = TemperatureScaler(
+        initial_temperature=1.0
+    )
 
-    print(f"Initial temperature: {scaler.temperature.item():.4f}")
+    print(
+        "Initial temperature: "
+        f"{scaler.get_temperature():.4f}"
+    )
 
     learned_temperature = scaler.fit(
         calibration_logits,
@@ -146,19 +193,61 @@ def main():
         test_labels,
     )
 
-    print_metrics(
-        "Temperature-Scaled Test Set",
-        calibrated_metrics,
+    print("\nTemperature-Scaled Test Set:")
+
+    print(
+        f"  Accuracy: {calibrated_metrics['accuracy']:.4f}"
+    )
+
+    print(
+        f"  ECE:      {calibrated_metrics['ece']:.4f}"
+    )
+
+    print(
+        f"  NLL:      {calibrated_metrics['nll']:.4f}"
+    )
+
+    print(
+        f"  Brier:    {calibrated_metrics['brier']:.4f}"
     )
 
     # ---------------------------------------------------------
-    # Comparison
+    # Calibration-bin statistics
+    # ---------------------------------------------------------
+
+    baseline_bins = calibration_bins(
+        test_logits,
+        test_labels,
+        num_bins=10,
+    )
+
+    calibrated_bins = calibration_bins(
+        calibrated_test_logits,
+        test_labels,
+        num_bins=10,
+    )
+
+    # ---------------------------------------------------------
+    # Compare
     # ---------------------------------------------------------
 
     changes = {
-        metric: calibrated_metrics[metric]
-        - baseline_metrics[metric]
-        for metric in baseline_metrics
+        "accuracy": (
+            calibrated_metrics["accuracy"]
+            - baseline_metrics["accuracy"]
+        ),
+        "ece": (
+            calibrated_metrics["ece"]
+            - baseline_metrics["ece"]
+        ),
+        "nll": (
+            calibrated_metrics["nll"]
+            - baseline_metrics["nll"]
+        ),
+        "brier": (
+            calibrated_metrics["brier"]
+            - baseline_metrics["brier"]
+        ),
     }
 
     print("\n" + "=" * 60)
@@ -166,31 +255,50 @@ def main():
     print("=" * 60)
 
     print(
-        f"{'Metric':<15}"
-        f"{'Baseline':>12}"
-        f"{'Calibrated':>15}"
-        f"{'Change':>12}"
+        "Metric             Baseline     Calibrated      Change"
     )
-
     print("-" * 60)
 
-    for metric in [
-        "accuracy",
-        "ece",
-        "nll",
-        "brier",
-    ]:
-        print(
-            f"{metric.upper():<15}"
-            f"{baseline_metrics[metric]:>12.4f}"
-            f"{calibrated_metrics[metric]:>15.4f}"
-            f"{changes[metric]:>12.4f}"
-        )
+    print(
+        f"ACCURACY            "
+        f"{baseline_metrics['accuracy']:.4f}"
+        f"         "
+        f"{calibrated_metrics['accuracy']:.4f}"
+        f"      "
+        f"{changes['accuracy']:.4f}"
+    )
+
+    print(
+        f"ECE                 "
+        f"{baseline_metrics['ece']:.4f}"
+        f"         "
+        f"{calibrated_metrics['ece']:.4f}"
+        f"     "
+        f"{changes['ece']:.4f}"
+    )
+
+    print(
+        f"NLL                 "
+        f"{baseline_metrics['nll']:.4f}"
+        f"         "
+        f"{calibrated_metrics['nll']:.4f}"
+        f"     "
+        f"{changes['nll']:.4f}"
+    )
+
+    print(
+        f"BRIER               "
+        f"{baseline_metrics['brier']:.4f}"
+        f"         "
+        f"{calibrated_metrics['brier']:.4f}"
+        f"     "
+        f"{changes['brier']:.4f}"
+    )
 
     print("=" * 60)
 
     # ---------------------------------------------------------
-    # Save results
+    # Save experiment results
     # ---------------------------------------------------------
 
     results = {
@@ -198,22 +306,38 @@ def main():
         "dataset": "CIFAR-10",
         "model": "ResNet-18",
         "calibration_fraction": 0.15,
-        "temperature": float(learned_temperature),
+        "temperature": learned_temperature,
         "baseline": baseline_metrics,
         "temperature_scaled": calibrated_metrics,
         "changes": changes,
+        "reliability": {
+            "baseline": baseline_bins,
+            "temperature_scaled": calibrated_bins,
+        },
     }
 
-    output_path = RESULTS_DIR / "temperature_scaling_results.json"
+    results_path = Path(
+        "results/temperature_scaling_results.json"
+    )
 
-    with open(output_path, "w", encoding="utf-8") as file:
+    results_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with results_path.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
         json.dump(
             results,
             file,
             indent=2,
         )
 
-    print(f"\nResults saved to: {output_path}")
+    print(
+        f"\nResults saved to: {results_path}"
+    )
 
 
 if __name__ == "__main__":
