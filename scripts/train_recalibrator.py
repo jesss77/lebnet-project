@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import torch
 
 from src.data.dataset import get_cifar10
@@ -9,6 +12,9 @@ from src.calibration.metrics import (
     brier_score,
     accuracy,
 )
+
+
+RESULTS_DIR = Path("results")
 
 
 def collect_predictions(model, loader, device):
@@ -33,24 +39,21 @@ def collect_predictions(model, loader, device):
     )
 
 
-def print_metrics(name, logits, labels):
-    acc = accuracy(logits, labels)
-    ece = expected_calibration_error(logits, labels)
-    nll = negative_log_likelihood(logits, labels)
-    brier = brier_score(logits, labels)
-
-    print(f"\n{name}:")
-    print(f"  Accuracy: {acc:.4f}")
-    print(f"  ECE:      {ece:.4f}")
-    print(f"  NLL:      {nll:.4f}")
-    print(f"  Brier:    {brier:.4f}")
-
+def calculate_metrics(logits, labels):
     return {
-        "accuracy": acc,
-        "ece": ece,
-        "nll": nll,
-        "brier": brier,
+        "accuracy": float(accuracy(logits, labels)),
+        "ece": float(expected_calibration_error(logits, labels)),
+        "nll": float(negative_log_likelihood(logits, labels)),
+        "brier": float(brier_score(logits, labels)),
     }
+
+
+def print_metrics(name, metrics):
+    print(f"\n{name}:")
+    print(f"  Accuracy: {metrics['accuracy']:.4f}")
+    print(f"  ECE:      {metrics['ece']:.4f}")
+    print(f"  NLL:      {metrics['nll']:.4f}")
+    print(f"  Brier:    {metrics['brier']:.4f}")
 
 
 def main():
@@ -60,31 +63,27 @@ def main():
 
     print(f"Using device: {device}")
 
-    # Load the exact same dataset split used during
-    # baseline evaluation.
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
     _, calibration_loader, test_loader = get_cifar10(
         batch_size=128
     )
 
-    # Recreate the exact baseline architecture.
-    model = get_resnet18(num_classes=10)
+    model = get_resnet18().to(device)
 
-    checkpoint = torch.load(
-        "results/baseline_resnet18.pt",
-        map_location=device,
+    checkpoint_path = RESULTS_DIR / "baseline_resnet18.pt"
+
+    model.load_state_dict(
+        torch.load(
+            checkpoint_path,
+            map_location=device,
+            weights_only=True,
+        )
     )
-
-    model.load_state_dict(checkpoint)
-    model.to(device)
 
     print("Baseline model loaded.")
 
-    # ---------------------------------------------------------
-    # Collect logits
-    # ---------------------------------------------------------
-
     print("Collecting calibration predictions...")
-
     calibration_logits, calibration_labels = collect_predictions(
         model,
         calibration_loader,
@@ -92,7 +91,6 @@ def main():
     )
 
     print("Collecting test predictions...")
-
     test_logits, test_labels = collect_predictions(
         model,
         test_loader,
@@ -100,99 +98,122 @@ def main():
     )
 
     # ---------------------------------------------------------
-    # Baseline test metrics
+    # Baseline
     # ---------------------------------------------------------
 
-    print()
-    print("=" * 60)
-    print("BASELINE")
-    print("=" * 60)
-
-    baseline_metrics = print_metrics(
-        "Test Set",
+    baseline_metrics = calculate_metrics(
         test_logits,
         test_labels,
     )
 
+    print("\n" + "=" * 60)
+    print("BASELINE")
+    print("=" * 60)
+
+    print_metrics(
+        "Test Set",
+        baseline_metrics,
+    )
+
     # ---------------------------------------------------------
-    # Fit temperature using ONLY calibration data
+    # Temperature scaling
     # ---------------------------------------------------------
 
-    print()
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("TEMPERATURE SCALING")
     print("=" * 60)
 
-    scaler = TemperatureScaler(
-        initial_temperature=1.0
-    ).to(device)
+    scaler = TemperatureScaler()
 
-    print(
-        f"Initial temperature: "
-        f"{scaler.get_temperature():.4f}"
-    )
+    print(f"Initial temperature: {scaler.temperature.item():.4f}")
 
-    scaler.fit(
+    learned_temperature = scaler.fit(
         calibration_logits,
         calibration_labels,
     )
 
-    temperature = scaler.get_temperature()
-
     print(
         f"Learned temperature: "
-        f"{temperature:.4f}"
+        f"{learned_temperature:.4f}"
     )
 
-    # ---------------------------------------------------------
-    # Apply learned temperature to TEST logits
-    # ---------------------------------------------------------
+    calibrated_test_logits = scaler.transform(
+        test_logits
+    )
 
-    calibrated_test_logits = scaler(
-        test_logits.to(device)
-    ).cpu()
-
-    # ---------------------------------------------------------
-    # Calibrated test metrics
-    # ---------------------------------------------------------
-
-    calibrated_metrics = print_metrics(
-        "Temperature-Scaled Test Set",
+    calibrated_metrics = calculate_metrics(
         calibrated_test_logits,
         test_labels,
+    )
+
+    print_metrics(
+        "Temperature-Scaled Test Set",
+        calibrated_metrics,
     )
 
     # ---------------------------------------------------------
     # Comparison
     # ---------------------------------------------------------
 
-    print()
-    print("=" * 60)
+    changes = {
+        metric: calibrated_metrics[metric]
+        - baseline_metrics[metric]
+        for metric in baseline_metrics
+    }
+
+    print("\n" + "=" * 60)
     print("BASELINE vs TEMPERATURE SCALING")
     print("=" * 60)
 
     print(
-        f"{'Metric':<12}"
-        f"{'Baseline':>14}"
-        f"{'Calibrated':>16}"
-        f"{'Change':>14}"
+        f"{'Metric':<15}"
+        f"{'Baseline':>12}"
+        f"{'Calibrated':>15}"
+        f"{'Change':>12}"
     )
 
-    print("-" * 56)
+    print("-" * 60)
 
-    for metric in ["accuracy", "ece", "nll", "brier"]:
-        baseline = baseline_metrics[metric]
-        calibrated = calibrated_metrics[metric]
-        change = calibrated - baseline
-
+    for metric in [
+        "accuracy",
+        "ece",
+        "nll",
+        "brier",
+    ]:
         print(
-            f"{metric.upper():<12}"
-            f"{baseline:>14.4f}"
-            f"{calibrated:>16.4f}"
-            f"{change:>14.4f}"
+            f"{metric.upper():<15}"
+            f"{baseline_metrics[metric]:>12.4f}"
+            f"{calibrated_metrics[metric]:>15.4f}"
+            f"{changes[metric]:>12.4f}"
         )
 
     print("=" * 60)
+
+    # ---------------------------------------------------------
+    # Save results
+    # ---------------------------------------------------------
+
+    results = {
+        "experiment": "temperature_scaling",
+        "dataset": "CIFAR-10",
+        "model": "ResNet-18",
+        "calibration_fraction": 0.15,
+        "temperature": float(learned_temperature),
+        "baseline": baseline_metrics,
+        "temperature_scaled": calibrated_metrics,
+        "changes": changes,
+    }
+
+    output_path = RESULTS_DIR / "temperature_scaling_results.json"
+
+    with open(output_path, "w", encoding="utf-8") as file:
+        json.dump(
+            results,
+            file,
+            indent=2,
+        )
+
+    print(f"\nResults saved to: {output_path}")
 
 
 if __name__ == "__main__":

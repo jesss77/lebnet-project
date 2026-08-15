@@ -1,85 +1,69 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class TemperatureScaler(nn.Module):
     """
-    Temperature scaling for neural-network calibration.
+    Temperature scaling for neural network calibration.
 
-    A single scalar temperature is learned on a held-out
-    calibration set. The model's logits are divided by
-    this temperature before applying softmax.
-
-    T > 1:
-        Produces softer / less confident probabilities.
-
-    T < 1:
-        Produces sharper / more confident probabilities.
+    A learned temperature is applied to model logits before converting
+    them into probabilities. The temperature is fitted using the
+    calibration split and must not be fitted on the test set.
     """
 
     def __init__(self, initial_temperature: float = 1.0):
         super().__init__()
 
         if initial_temperature <= 0:
-            raise ValueError(
-                "initial_temperature must be greater than 0."
-            )
+            raise ValueError("initial_temperature must be positive.")
 
         self.temperature = nn.Parameter(
-            torch.tensor(
-                [initial_temperature],
-                dtype=torch.float32,
-            )
+            torch.tensor(float(initial_temperature))
         )
 
     def forward(self, logits: torch.Tensor) -> torch.Tensor:
         """
         Apply temperature scaling to logits.
         """
-
-        temperature = self.temperature.clamp_min(1e-6)
+        temperature = torch.clamp(
+            self.temperature,
+            min=1e-6,
+        )
 
         return logits / temperature
+
+    def transform(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Apply the learned temperature to logits.
+
+        This is an explicit alias for forward() so that the scaler can
+        be used with either scaler(logits) or scaler.transform(logits).
+        """
+        return self.forward(logits)
 
     def fit(
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
-        max_iter: int = 100,
-    ):
+        max_iter: int = 50,
+    ) -> float:
         """
-        Learn the temperature by minimizing NLL
-        on the calibration set.
+        Learn the temperature by minimizing cross-entropy loss on
+        calibration predictions.
+
+        Args:
+            logits: Model logits from the calibration set.
+            labels: Ground-truth calibration labels.
+            max_iter: Maximum number of LBFGS iterations.
+
+        Returns:
+            Learned temperature as a Python float.
         """
-
-        if logits.ndim != 2:
-            raise ValueError(
-                "logits must have shape [N, num_classes]."
-            )
-
-        if labels.ndim != 1:
-            raise ValueError(
-                "labels must have shape [N]."
-            )
-
-        if logits.shape[0] != labels.shape[0]:
-            raise ValueError(
-                "logits and labels must contain the same "
-                "number of samples."
-            )
-
-        # Keep calibration data on the same device
-        # as the temperature parameter.
-        device = self.temperature.device
-
-        logits = logits.to(device)
-        labels = labels.to(device)
+        logits = logits.detach()
+        labels = labels.detach()
 
         criterion = nn.CrossEntropyLoss()
 
-        # LBFGS works well for optimizing the single
-        # temperature parameter.
         optimizer = torch.optim.LBFGS(
             [self.temperature],
             lr=0.01,
@@ -90,7 +74,12 @@ class TemperatureScaler(nn.Module):
         def closure():
             optimizer.zero_grad()
 
-            scaled_logits = self.forward(logits)
+            temperature = torch.clamp(
+                self.temperature,
+                min=1e-6,
+            )
+
+            scaled_logits = logits / temperature
 
             loss = criterion(
                 scaled_logits,
@@ -103,31 +92,13 @@ class TemperatureScaler(nn.Module):
 
         optimizer.step(closure)
 
-        # Ensure temperature remains positive.
         with torch.no_grad():
             self.temperature.clamp_(min=1e-6)
 
-        return self
+        return float(self.temperature.detach().item())
 
     def get_temperature(self) -> float:
         """
         Return the learned temperature as a Python float.
         """
-
-        return self.temperature.item()
-
-
-def apply_temperature(
-    logits: torch.Tensor,
-    temperature: float,
-) -> torch.Tensor:
-    """
-    Apply a fixed temperature to logits.
-    """
-
-    if temperature <= 0:
-        raise ValueError(
-            "temperature must be greater than 0."
-        )
-
-    return logits / temperature
+        return float(self.temperature.detach().item())
