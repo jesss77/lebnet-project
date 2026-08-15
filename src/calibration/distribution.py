@@ -1,71 +1,80 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class DistributionRecalibrator(nn.Module):
     """
-    Distribution recalibrator based on Kuleshov et al.
+    Distribution recalibrator for multiclass classification.
 
-    Maps a K-dimensional probability vector produced by a
-    pretrained classifier to a recalibrated K-dimensional
-    probability vector.
+    The recalibrator receives the pretrained model's probability
+    distribution and learns a correction to its logits.
 
-    The architecture is configurable so that different
-    recalibrator
-    capacities can be compared experimentally.
+    The correction is initialized to zero, so the initial
+    recalibrator behaves like the identity mapping.
+
+    This makes the experiment a conservative recalibration step
+    rather than an independently initialized classifier.
     """
 
     def __init__(
         self,
         num_classes: int,
-        hidden_dims: tuple[int, ...] = (64, 64),
+        hidden_dim: int = 32,
     ):
         super().__init__()
 
-        layers = []
+        self.num_classes = num_classes
 
-        input_dim = num_classes
-
-        for hidden_dim in hidden_dims:
-            layers.append(
-                nn.Linear(
-                    input_dim,
-                    hidden_dim,
-                )
-            )
-
-            layers.append(nn.ReLU())
-
-            input_dim = hidden_dim
-
-        layers.append(
-            nn.Linear(
-                input_dim,
-                num_classes,
-            )
+        self.input_layer = nn.Linear(
+            num_classes,
+            hidden_dim,
         )
 
-        self.network = nn.Sequential(*layers)
+        self.output_layer = nn.Linear(
+            hidden_dim,
+            num_classes,
+        )
+
+        self.network = nn.Sequential(
+            self.input_layer,
+            nn.ReLU(),
+            self.output_layer,
+        )
+
+        # Start with zero correction.
+        #
+        # This means:
+        #
+        # calibrated_logits = original_logits + 0
+        #
+        # at initialization.
+        nn.init.zeros_(self.output_layer.weight)
+        nn.init.zeros_(self.output_layer.bias)
 
     def forward(
         self,
         probabilities: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Recalibrate a batch of probability distributions.
+        Convert a probability distribution into a recalibrated
+        probability distribution.
 
-        Args:
-            probabilities:
-                Tensor of shape [batch_size, num_classes].
-
-        Returns:
-            Recalibrated probability distributions with
-            rows summing to one.
+        The original logits are recovered from log probabilities.
+        A learned residual correction is then added.
         """
 
-        logits = self.network(probabilities)
+        probabilities = probabilities.clamp_min(1e-8)
 
-        return torch.softmax(
-            logits,
+        original_logits = torch.log(probabilities)
+
+        correction = self.network(probabilities)
+
+        calibrated_logits = (
+            original_logits + correction
+        )
+
+        return F.softmax(
+            calibrated_logits,
             dim=1,
         )
